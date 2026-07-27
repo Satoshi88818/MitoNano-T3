@@ -1,0 +1,316 @@
+//! # mitonano_orchestrator
+//!
+//! A tested, compiling implementation of the federated domain-decomposition
+//! orchestrator described in the uploaded source material
+//! (`Federated_Orchestrator_Unvalidated.txt`) — validated and, in several
+//! places, fixed.
+//!
+//! ## What was wrong with the source material
+//!
+//! The material did not compile, for multiple independent reasons:
+//!
+//! 1. `node.rs`'s `handle_local_agent_movement` had
+//!    `let target_node = /* find neighbor via decomposition */;` — a
+//!    comment where an expression was required. Not valid Rust.
+//! 2. `lib.rs` declared `pub mod domain; pub mod node; pub mod coordinator;
+//!    pub mod comm; pub mod migration;` but `node.rs` and `domain.rs`
+//!    both `use crate::agent::Agent` / `crate::engine::SimulationEngine` /
+//!    `crate::environment::Bounds` — modules never declared in `lib.rs`.
+//!    Unresolved-module errors.
+//! 3. `SubDomain::bounds.contains_with_halo(...)` was called but never
+//!    defined anywhere.
+//! 4. `SimulationEngine::new_default()` was called but the type was never
+//!    defined anywhere.
+//! 5. `coordinator.rs`'s `handle_migrations` had
+//!    `for node in nodes { ... nodes.get_mut(target) ... }` — two
+//!    overlapping mutable borrows of the same slice. A genuine
+//!    borrow-checker violation, not a style issue.
+//!
+//! Beyond the compile errors, two logic bugs were present even in the
+//! *intended* behavior:
+//!
+//! 6. `MitoNode` had no way to actually answer "which node does this
+//!    point belong to now" — the very thing bug #1's comment gestured at
+//!    — because it held no reference to the domain decomposition at all.
+//! 7. The comment `// Remove migrated agents` sat above code that never
+//!    removed them, meaning a migrating agent would end up duplicated:
+//!    present in both the source node's list and the target node's list.
+//!
+//! All seven are fixed in this crate — see `node.rs` and `coordinator.rs`'s
+//! module docs for the specifics of each fix, and `tests/migration.rs` for
+//! end-to-end validation that migration actually conserves agents and
+//! routes them correctly across a multi-node cluster.
+//!
+//! ## Scope, stated plainly
+//!
+//! This validates and fixes the **orchestration logic**: domain
+//! decomposition, per-node stepping, migration, and load-imbalance
+//! detection. It does **not** reproduce the full `mitonano_core`
+//! simulation engine (SDE motion, PK decay, field diffusion, agent-agent
+//! interaction) — `Agent` and `LocalEngine` here are deliberately minimal
+//! stand-ins (see `agent.rs`'s module docs) sufficient to drive and test
+//! the orchestration logic honestly. It also does **not** implement actual
+//! network/process-level distribution (`comm.rs`, using something like
+//! `crossbeam-channel` or `mpi`) or field halo exchange — both are called
+//! out as explicit future work in the source material's own "Next
+//! Immediate Steps" list, and remain so here (see `coordinator.rs`'s
+//! `exchange_boundaries` docs). Everything in this crate currently runs
+//! single-process, in-memory, sequentially across nodes — "federated" in
+//! architecture/data-partitioning only, not yet in actual deployment.
+
+pub mod agent;
+pub mod coordinator;
+pub mod domain;
+pub mod environment;
+pub mod migration;
+pub mod node;
+
+use nalgebra::Vector3;
+
+use crate::coordinator::{OrchestratorCoordinator, RebalanceReport};
+use crate::domain::DomainDecomposition;
+use crate::environment::Bounds;
+use crate::migration::MigrationRecord;
+use crate::node::MitoNode;
+
+/// Main federated simulation handle.
+pub struct FederatedMitoNano {
+    coordinator: OrchestratorCoordinator,
+    nodes: Vec<MitoNode>,
+    global_time: f64,
+    tick: u64,
+    migration_log: Vec<MigrationRecord>,
+}
+
+impl FederatedMitoNano {
+    pub fn new(num_nodes: usize, global_bounds: Bounds) -> Self {
+        let decomposition = DomainDecomposition::new(global_bounds, num_nodes);
+        let nodes = decomposition.create_nodes();
+        let coordinator = OrchestratorCoordinator::new(decomposition);
+        Self { coordinator, nodes, global_time: 0.0, tick: 0, migration_log: Vec::new() }
+    }
+
+    pub fn nodes(&self) -> &[MitoNode] {
+        &self.nodes
+    }
+
+    pub fn migration_log(&self) -> &[MigrationRecord] {
+        &self.migration_log
+    }
+
+    pub fn total_agent_count(&self) -> usize {
+        self.nodes.iter().map(|n| n.agents.len()).sum()
+    }
+
+    /// Adds an agent to whichever node's local bounds currently contain
+    /// its position. Panics if the position is outside the global domain
+    /// entirely — callers are expected to place agents inside the
+    /// simulated region, unlike agents that later drift outside it during
+    /// stepping (which get clamped, not rejected; see `node.rs`).
+    pub fn add_agent(&mut self, agent: crate::agent::Agent) {
+        let target = self
+            .coordinator
+            .decomposition()
+            .domain_containing(agent.position)
+            .expect("add_agent: position is outside the global domain");
+        self.nodes[target].agents.push(agent);
+    }
+
+    /// Advances the entire federated simulation by one global step:
+    /// local computation on every node, then migration delivery, then a
+    /// load-imbalance check.
+    ///
+    /// `velocity` is this validation crate's shared motion stand-in for
+    /// every agent on every node (see `agent.rs`'s module docs) — a real
+    /// engine would derive per-agent motion independently.
+    pub fn step(&mut self, dt: f64, velocity: Vector3<f64>) {
+        let decomposition = self.coordinator.decomposition();
+        for node in &mut self.nodes {
+            node.local_step(dt, velocity, decomposition);
+        }
+        self.coordinator.exchange_boundaries(&mut self.nodes);
+        let new_records = self.coordinator.handle_migrations(&mut self.nodes, self.tick);
+        self.migration_log.extend(new_records);
+        self.global_time += dt;
+        self.tick += 1;
+    }
+
+    /// Checks current per-node load balance without modifying anything —
+    /// see `coordinator.rs`'s `RebalanceReport` docs for what "needs
+    /// rebalance" means.
+    pub fn check_balance(&self, imbalance_threshold: f64) -> RebalanceReport {
+        self.coordinator.maybe_rebalance(&self.nodes, imbalance_threshold)
+    }
+
+    /// Checks balance, and if it's beyond `imbalance_threshold`, actually
+    /// repartitions the domain and migrates every agent into the new
+    /// layout (see `coordinator.rs`'s `rebalance` docs). Returns the
+    /// *post*-rebalance report so the caller can see the result, or `None`
+    /// if nothing needed to change.
+    ///
+    /// The migration log is intentionally *not* extended by this — a
+    /// rebalance is a topology change, not agents crossing their normal
+    /// sub-domain boundaries under motion, so mixing the two into one
+    /// audit trail would make `tests/migration.rs`-style "each agent
+    /// migrates 0->1->2->3" chain-checking ambiguous about which kind of
+    /// event it's looking at.
+    ///
+    /// This does not check `coordinator().decomposition().narrow_subdomains()`
+    /// after repartitioning — see `coordinator.rs`'s `rebalance` docs for
+    /// why that's a real, open gap rather than something silently handled.
+    pub fn rebalance_if_needed(&mut self, imbalance_threshold: f64) -> Option<RebalanceReport> {
+        let pre = self.check_balance(imbalance_threshold);
+        if !pre.needs_rebalance {
+            return None;
+        }
+        let nodes = std::mem::take(&mut self.nodes);
+        let (new_nodes, post) = self.coordinator.rebalance(nodes, imbalance_threshold);
+        self.nodes = new_nodes;
+        Some(post)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+    use nalgebra::Point3;
+
+    #[test]
+    fn new_creates_the_requested_number_of_nodes() {
+        let sim = FederatedMitoNano::new(4, Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]));
+        assert_eq!(sim.nodes().len(), 4);
+    }
+
+    #[test]
+    fn add_agent_places_it_in_the_correct_node() {
+        let mut sim = FederatedMitoNano::new(4, Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]));
+        sim.add_agent(Agent::new(1, Point3::new(60.0, 5.0, 5.0), 1.0)); // slab [50,75) -> node 2
+        assert_eq!(sim.nodes()[2].agents.len(), 1);
+        assert_eq!(sim.total_agent_count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the global domain")]
+    fn add_agent_rejects_a_position_outside_the_global_domain() {
+        let mut sim = FederatedMitoNano::new(2, Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        sim.add_agent(Agent::new(1, Point3::new(999.0, 5.0, 5.0), 1.0));
+    }
+
+    #[test]
+    fn stepping_conserves_total_agent_count_across_many_migrations() {
+        let mut sim = FederatedMitoNano::new(5, Bounds::new([0.0, 0.0, 0.0], [50.0, 10.0, 10.0]));
+        for i in 0..30 {
+            sim.add_agent(Agent::new(i, Point3::new(1.0, 5.0, 5.0), 1.0));
+        }
+        let expected_count = sim.total_agent_count();
+        // Fast rightward velocity forces every agent to cross several
+        // node boundaries over the course of the run.
+        for _ in 0..20 {
+            sim.step(1.0, Vector3::new(3.0, 0.0, 0.0));
+            assert_eq!(
+                sim.total_agent_count(),
+                expected_count,
+                "total agent count must be conserved across migration-heavy steps"
+            );
+        }
+        assert!(!sim.migration_log().is_empty(), "this scenario should have produced at least one migration");
+    }
+
+    #[test]
+    fn every_agent_ends_up_in_a_node_whose_bounds_actually_contain_it() {
+        let mut sim = FederatedMitoNano::new(4, Bounds::new([0.0, 0.0, 0.0], [40.0, 10.0, 10.0]));
+        for i in 0..10 {
+            sim.add_agent(Agent::new(i, Point3::new(2.0, 5.0, 5.0), 1.0));
+        }
+        for _ in 0..15 {
+            sim.step(0.7, Vector3::new(1.3, 0.0, 0.0));
+        }
+        for node in sim.nodes() {
+            for agent in &node.agents {
+                assert!(
+                    node.local_bounds.contains(agent.position)
+                        || {
+                            // An agent can sit exactly at this node's own far
+                            // (half-open) boundary transiently — see
+                            // node.rs's `Some(_)` branch — which is not itself
+                            // a bug, just documented here as the one
+                            // legitimate exception to strict containment.
+                            (agent.position.x - node.local_bounds.max[0]).abs() < 1e-9
+                        },
+                    "agent {} in node {} at {:?} is outside that node's bounds {:?}",
+                    agent.id,
+                    node.id,
+                    agent.position,
+                    node.local_bounds
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rebalance_if_needed_returns_none_when_already_balanced() {
+        let mut sim = FederatedMitoNano::new(2, Bounds::new([0.0, 0.0, 0.0], [20.0, 10.0, 10.0]));
+        for i in 0..10 {
+            sim.add_agent(Agent::new(i, Point3::new(2.0, 5.0, 5.0), 1.0));
+            sim.add_agent(Agent::new(100 + i, Point3::new(12.0, 5.0, 5.0), 1.0));
+        }
+        assert!(sim.rebalance_if_needed(1.5).is_none());
+    }
+
+    #[test]
+    fn rebalance_if_needed_repartitions_and_conserves_agents_when_imbalanced() {
+        let mut sim = FederatedMitoNano::new(4, Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]));
+        // All 40 agents land in the same slab -> maximally imbalanced.
+        // Spread across a narrow band (not one exact coordinate) so a
+        // spatial cut can actually separate them.
+        for i in 0..40 {
+            sim.add_agent(Agent::new(i, Point3::new(5.0 + i as f64 * 0.1, 5.0, 5.0), 1.0));
+        }
+        let total_before = sim.total_agent_count();
+        let report = sim.rebalance_if_needed(1.5).expect("this scenario should need rebalancing");
+        assert!(!report.needs_rebalance, "should be balanced immediately after rebalancing");
+        assert_eq!(sim.total_agent_count(), total_before, "rebalance must conserve total agent count");
+        assert_eq!(sim.nodes().len(), 4, "rebalance must not change the number of nodes for well-separated positions");
+    }
+
+    #[test]
+    fn rebalance_does_not_extend_the_migration_log() {
+        let mut sim = FederatedMitoNano::new(4, Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]));
+        for i in 0..40 {
+            sim.add_agent(Agent::new(i, Point3::new(5.0 + i as f64 * 0.1, 5.0, 5.0), 1.0));
+        }
+        let log_len_before = sim.migration_log().len();
+        sim.rebalance_if_needed(1.5).expect("should need rebalancing");
+        assert_eq!(
+            sim.migration_log().len(),
+            log_len_before,
+            "rebalance is a topology change, not a normal boundary-crossing migration, and should not appear in the migration audit log"
+        );
+    }
+
+    /// This is the crate's own regression test for the exact bug the T2
+    /// document described finding in an earlier version of `rebalance`:
+    /// when many agents share the same (or extremely close) x-position, a
+    /// naive median-cut can propose duplicate boundary values, which
+    /// would either collapse into zero-width sub-domains or panic. This
+    /// test constructs that scenario directly — every agent at *exactly*
+    /// the same position — and confirms the crate handles it by producing
+    /// fewer (non-degenerate) sub-domains and conserving every agent,
+    /// rather than panicking or losing agents.
+    #[test]
+    fn rebalance_survives_many_agents_at_the_exact_same_position() {
+        let mut sim = FederatedMitoNano::new(4, Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]));
+        for i in 0..50 {
+            sim.add_agent(Agent::new(i, Point3::new(37.0, 5.0, 5.0), 1.0)); // identical position
+        }
+        let total_before = sim.total_agent_count();
+        let result = sim.rebalance_if_needed(1.5);
+        assert!(result.is_some(), "a cluster with all agents in one node should trigger a rebalance attempt");
+        // No 1D boundary can separate agents at an identical position, so
+        // the post-rebalance report legitimately can still show imbalance
+        // (there's a hard physical limit here, not a bug) — what matters
+        // is that nothing panicked and no agent was lost or duplicated.
+        assert_eq!(sim.total_agent_count(), total_before, "agent count must be conserved even in this degenerate case");
+    }
+}
