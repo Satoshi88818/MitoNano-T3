@@ -1,0 +1,103 @@
+//! Axis-aligned bounding box used for both a node's local sub-domain and
+//! the global simulation domain.
+//!
+//! The uploaded source material called `sd.bounds.contains_with_halo(point, sd.halo_thickness)`
+//! in `domain.rs` — a method that was never defined anywhere in the
+//! material. This module supplies it for real.
+
+use nalgebra::Point3;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bounds {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+impl Bounds {
+    pub fn new(min: [f64; 3], max: [f64; 3]) -> Self {
+        debug_assert!(
+            min[0] <= max[0] && min[1] <= max[1] && min[2] <= max[2],
+            "Bounds::new requires min <= max on every axis, got min={min:?} max={max:?}"
+        );
+        Bounds { min, max }
+    }
+
+    /// Strict containment: `point` is inside `[min, max)` on every axis.
+    /// Half-open (max exclusive) so that two adjoining sub-domains sharing
+    /// a boundary plane never both claim to contain a point sitting
+    /// exactly on it — a real correctness requirement for domain
+    /// decomposition that the source material never addressed at all.
+    pub fn contains(&self, point: Point3<f64>) -> bool {
+        (self.min[0]..self.max[0]).contains(&point.x)
+            && (self.min[1]..self.max[1]).contains(&point.y)
+            && (self.min[2]..self.max[2]).contains(&point.z)
+    }
+
+    /// Containment against bounds expanded outward by `halo` on every
+    /// axis in every direction — used to decide which sub-domains need a
+    /// given boundary point's data for halo/ghost-region exchange (a
+    /// point near a sub-domain's edge is relevant to that sub-domain's
+    /// neighbor too, not just to whichever domain strictly contains it).
+    pub fn contains_with_halo(&self, point: Point3<f64>, halo: f64) -> bool {
+        (self.min[0] - halo..self.max[0] + halo).contains(&point.x)
+            && (self.min[1] - halo..self.max[1] + halo).contains(&point.y)
+            && (self.min[2] - halo..self.max[2] + halo).contains(&point.z)
+    }
+
+    /// Clamps `point` to lie within `[min, max]` (inclusive) on every
+    /// axis. Used when an agent exits the *global* simulation domain
+    /// entirely (no sub-domain claims it) — clamping keeps it in the
+    /// simulation rather than silently discarding it, which would break
+    /// agent-count conservation.
+    pub fn clamp_point(&self, point: Point3<f64>) -> Point3<f64> {
+        Point3::new(
+            point.x.clamp(self.min[0], self.max[0]),
+            point.y.clamp(self.min[1], self.max[1]),
+            point.z.clamp(self.min[2], self.max[2]),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contains_is_half_open_at_max() {
+        let b = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        assert!(b.contains(Point3::new(0.0, 0.0, 0.0)));
+        assert!(b.contains(Point3::new(9.999, 5.0, 5.0)));
+        assert!(!b.contains(Point3::new(10.0, 5.0, 5.0)), "max boundary must be exclusive");
+    }
+
+    #[test]
+    fn adjoining_bounds_never_both_contain_the_shared_boundary_point() {
+        let left = Bounds::new([0.0, 0.0, 0.0], [5.0, 10.0, 10.0]);
+        let right = Bounds::new([5.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let boundary_point = Point3::new(5.0, 5.0, 5.0);
+        assert!(
+            left.contains(boundary_point) != right.contains(boundary_point)
+                || !left.contains(boundary_point),
+            "exactly one (or neither) of two adjoining domains should claim a shared-boundary point"
+        );
+        assert!(!left.contains(boundary_point));
+        assert!(right.contains(boundary_point));
+    }
+
+    #[test]
+    fn contains_with_halo_extends_past_the_strict_boundary() {
+        let b = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let just_outside = Point3::new(10.5, 5.0, 5.0);
+        assert!(!b.contains(just_outside));
+        assert!(b.contains_with_halo(just_outside, 1.0));
+        assert!(!b.contains_with_halo(just_outside, 0.1));
+    }
+
+    #[test]
+    fn clamp_point_pulls_outliers_back_inside() {
+        let b = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let outside = Point3::new(-5.0, 15.0, 3.0);
+        let clamped = b.clamp_point(outside);
+        assert_eq!(clamped, Point3::new(0.0, 10.0, 3.0));
+    }
+}
