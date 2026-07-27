@@ -1,0 +1,620 @@
+//! # mitonano_federated
+//!
+//! Branch B: the actual integration of `mitonano_core`'s real physics
+//! engine (`UnifiedEngine` — bounded SDE motion, field release/uptake,
+//! agent-agent exchange, field diffusion) with `mitonano_orchestrator`'s
+//! domain-decomposition approach. Every node in [`FederatedUnifiedEngine`]
+//! runs a genuine, persistent `UnifiedEngine` instance — not the
+//! `LocalEngine`/toy-`Agent` stand-in `mitonano_orchestrator`'s own
+//! `node.rs` uses (and is explicit in its own docs about being a
+//! stand-in for exactly this).
+//!
+//! ## Why this is a new crate rather than a change to `mitonano_orchestrator`
+//!
+//! `mitonano_orchestrator` has 61 passing tests built against its own
+//! `Agent` (nalgebra `Point3` + `id` + `payload`) and `MitoNode`
+//! (`LocalEngine` stand-in). `mitonano_core::agent::Agent` is a different,
+//! independently-validated type (`[f64; 3]` position, no `id`, real SDE
+//! physics) whose shape is fixed by `unified_engine.rs`'s verbatim call
+//! sites — it can't be made identical to the orchestrator's `Agent`
+//! without breaking one side or the other. Rather than force a merge that
+//! would either break 61 already-verified orchestrator tests or bend
+//! `mitonano_core`'s validated shape to fit them, this crate re-implements
+//! the *coordination logic* — domain decomposition, migration, per-tick
+//! orchestration — fresh, against real `mitonano_core` types directly.
+//! `mitonano_orchestrator` remains untouched and fully passing as the
+//! validated proof of the orchestration logic in isolation;
+//! `mitonano_core` remains untouched and fully passing as the validated
+//! proof of the physics in isolation; this crate is what proves they
+//! *compose* correctly.
+//!
+//! ## What's proven here that neither `mitonano_core` nor
+//! `mitonano_orchestrator` proves alone
+//!
+//! `mitonano_core::unified_engine`'s own tests prove mass conservation
+//! for a single, non-distributed engine. `mitonano_orchestrator`'s tests
+//! prove agent-count conservation for toy agents with no real physics.
+//! Neither proves that splitting the real physics across multiple
+//! independently-stepped engines, with agents migrating between them and
+//! genuinely interacting *across* node boundaries mid-simulation, still
+//! conserves mass end to end. That's exactly what `tests/conservation.rs`
+//! checks: real SDE motion, real field coupling, real agent-agent
+//! exchange (both within and across nodes), real diffusion (both within
+//! and across nodes), and real migration, all simultaneously active,
+//! still satisfying the same bookkeeping identity
+//! `total_combined_mass(t) == C0 - cumulative_eliminated(t)` that
+//! `mitonano_core`'s own strongest single-engine test checks — now summed
+//! across every node's engine and field.
+//!
+//! ## Revision history
+//!
+//! **T1** (first integration pass): every node ran a real `UnifiedEngine`
+//! via its own `run()` call, but agent-agent interaction and field
+//! diffusion were each strictly node-local — an agent near a seam did not
+//! exchange payload with, or diffuse mass toward, anything on the other
+//! side of it. Two gaps, both documented and left open rather than
+//! hidden.
+//!
+//! **T2** (this revision) fixes both, without modifying the verbatim
+//! `unified_engine.rs` at all:
+//!
+//! - **Cross-node agent-agent interaction.** `step` no longer calls
+//!   `UnifiedEngine::run` as an atomic black box — it reimplements that
+//!   method's exact per-tick sequence directly (see `step`'s own docs for
+//!   the full phase breakdown), which is what makes it possible to insert
+//!   a genuine cross-node interaction phase between the local-interaction
+//!   phase and the diffusion phase. Every node pair whose slabs are
+//!   within `interaction.radius` of each other now has its agents
+//!   actually exchange payload across the seam, using the identical
+//!   `k_exchange * (payload_j - payload_i) * dt` formula
+//!   `mitonano_core::interaction` uses locally, computed from a snapshot
+//!   taken before any interaction phase mutates payload — exactly
+//!   conservative, order-independent, the same antisymmetry guarantee
+//!   `mitonano_core::interaction`'s own docs describe.
+//! - **Cross-node field diffusion.** `mitonano_core::concentration` grew
+//!   two new methods, `boundary_mass` and `add_boundary_mass` (see their
+//!   docs), specifically so two adjacent nodes' fields could exchange
+//!   mass across their shared seam using the *exact same*
+//!   `(mass_a - mass_b) / spacing^2` formula the interior diffusion
+//!   scheme already uses internally — not a different, bolted-on formula
+//!   at the boundary, which would have made the scheme numerically
+//!   discontinuous right at every node seam.
+//!
+//! ## Real, deliberate scope limits still open after T2
+//!
+//! 1. **No rebalancing.** Domain decomposition is fixed, equal-width
+//!    slabs, chosen once at construction — `mitonano_orchestrator`'s
+//!    `rebalance`/`ensure_valid_for_halo` machinery is not reused or
+//!    reimplemented here.
+//! 2. **Cross-node interaction is O(agents_i × agents_j) per qualifying
+//!    node pair**, not restricted to only the agents actually near the
+//!    seam (a proper ghost-agent list, gathered once per tick, would cut
+//!    this down — the distance check inside the loop already ensures
+//!    only near-seam *pairs* produce a nonzero exchange, so this is a
+//!    performance gap, not a correctness one, but it's real: a cluster
+//!    with many agents per node and many adjacent-enough node pairs would
+//!    pay for a full cross-product scan it doesn't need).
+//!
+//! ## The coupling is exact, not merely approximately conservative —
+//! verified directly, not assumed
+//!
+//! Both couplings are linear, additive corrections computed from a
+//! single pre-tick snapshot shared with each node's own local pass — the
+//! same structure `mitonano_core::interaction`'s antisymmetric formula
+//! and `mitonano_core::concentration`'s interior flux formula already
+//! use internally. That structure means a federated split isn't just
+//! *conservative* relative to one monolithic engine over the combined
+//! domain — it's *identical* to it, term for term, not an approximation
+//! with a bounded error. This isn't asserted from the algebra alone;
+//! `tests/equivalence.rs` checks it directly, isolating each coupling
+//! mechanism (field diffusion across a seam; agent interaction across
+//! multiple seams) and comparing a federated run cell-for-cell / agent-
+//! for-agent against a monolithic `UnifiedEngine` over the same combined
+//! domain, matching to 1e-9 over hundreds of ticks — not merely "total
+//! mass conserved," but "produces the same field profile and the same
+//! per-agent payloads a single engine would have produced."
+//!
+//! A future revision that actually reconciles `mitonano_core::Agent` and
+//! `mitonano_orchestrator::Agent` into one shared type could reuse
+//! `mitonano_orchestrator`'s already-tested `rebalance` directly instead
+//! of leaving gap #1 open.
+
+use mitonano_core::agent::{Agent, AgentParams};
+use mitonano_core::concentration::{ConcentrationField, XFace};
+use mitonano_core::environment::Bounds;
+use mitonano_core::interaction::{step_agent_interactions, InteractionParams};
+use mitonano_core::orchestration::SpatialIndex;
+use mitonano_core::unified_engine::UnifiedEngine;
+use rand::Rng;
+
+/// Audit record for one agent crossing from one node's engine into
+/// another's, analogous to `mitonano_orchestrator::migration::MigrationRecord`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MigrationRecord {
+    pub agent_id: u64,
+    pub from_node: usize,
+    pub to_node: usize,
+    pub tick: u64,
+}
+
+/// Aggregated mass-bookkeeping snapshot across every node, summing each
+/// node's own `UnifiedTickStats`-shaped quantities — the distributed
+/// analogue of `mitonano_core::unified_engine::UnifiedTickStats`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FederatedTickStats {
+    pub tick: u64,
+    pub total_agent_payload: f64,
+    pub total_field_mass: f64,
+    pub total_combined_mass: f64,
+    pub cumulative_eliminated: f64,
+}
+
+/// One node's slice of the federated simulation: a real, persistent
+/// `UnifiedEngine` plus that node's local x-slab bounds (for migration
+/// detection) and a parallel `agent_ids` list (since
+/// `mitonano_core::Agent` carries no id — see module docs — identity is
+/// tracked here, alongside `engine.agents`, index-for-index, and moved
+/// together on every push/`swap_remove`).
+pub struct FederatedNode {
+    pub id: usize,
+    pub local_bounds: Bounds,
+    pub engine: UnifiedEngine,
+    pub agent_ids: Vec<u64>,
+}
+
+/// The distributed simulation: `num_nodes` [`FederatedNode`]s, each
+/// running a real `UnifiedEngine` over an equal-width x-slab of
+/// `global_bounds`, with agents migrating between adjacent nodes'
+/// engines as their real SDE motion carries them across a slab boundary.
+pub struct FederatedUnifiedEngine {
+    pub global_bounds: Bounds,
+    pub nodes: Vec<FederatedNode>,
+    pub k_uptake: f64,
+    pub tick: u64,
+    cumulative_eliminated: f64,
+    migration_log: Vec<MigrationRecord>,
+}
+
+/// Everything needed to construct one node's `UnifiedEngine`, common to
+/// every node in the cluster (same physics parameters everywhere — only
+/// the spatial slab and, therefore, the field's extent differ node to
+/// node).
+#[derive(Clone, Copy, Debug)]
+pub struct FederatedEngineConfig {
+    pub agent_params: AgentParams,
+    pub interaction: InteractionParams,
+    pub field_diffusion_coeff: f64,
+    pub dt: f64,
+    pub k_uptake: f64,
+    /// Per-node `ConcentrationField` grid resolution (that node's local
+    /// slab, not the global domain — see module docs, gap #2).
+    pub field_grid: (usize, usize, usize),
+    /// Per-node `SpatialIndex` grid resolution (also local-slab-sized).
+    pub index_grid: (usize, usize, usize),
+}
+
+impl FederatedUnifiedEngine {
+    pub fn new(num_nodes: usize, global_bounds: Bounds, config: FederatedEngineConfig) -> Self {
+        assert!(num_nodes > 0, "FederatedUnifiedEngine::new requires at least one node");
+        let dx = global_bounds.width(0) / num_nodes as f64;
+        let mut nodes = Vec::with_capacity(num_nodes);
+        for i in 0..num_nodes {
+            let min_x = global_bounds.min[0] + i as f64 * dx;
+            let max_x = if i == num_nodes - 1 { global_bounds.max[0] } else { min_x + dx };
+            let local_bounds =
+                Bounds::new([min_x, global_bounds.min[1], global_bounds.min[2]], [max_x, global_bounds.max[1], global_bounds.max[2]]);
+
+            let (fnx, fny, fnz) = config.field_grid;
+            let field = ConcentrationField::new(local_bounds, fnx, fny, fnz);
+            let (inx, iny, inz) = config.index_grid;
+            let index = SpatialIndex::new(local_bounds, inx, iny, inz);
+
+            // Motion is clamped against the *global* domain (agents must
+            // be free to cross local slab seams — only the true outer
+            // edge should constrain their SDE motion, mirroring the same
+            // reasoning `mitonano_orchestrator`'s own node.rs applies to
+            // its toy agents).
+            let engine = UnifiedEngine::new(
+                Vec::new(),
+                config.agent_params,
+                global_bounds,
+                field,
+                config.field_diffusion_coeff,
+                index,
+                config.interaction,
+                config.dt,
+            );
+
+            nodes.push(FederatedNode { id: i, local_bounds, engine, agent_ids: Vec::new() });
+        }
+
+        FederatedUnifiedEngine {
+            global_bounds,
+            nodes,
+            k_uptake: config.k_uptake,
+            tick: 0,
+            cumulative_eliminated: 0.0,
+            migration_log: Vec::new(),
+        }
+    }
+
+    pub fn total_agent_count(&self) -> usize {
+        self.nodes.iter().map(|n| n.engine.agents.len()).sum()
+    }
+
+    pub fn migration_log(&self) -> &[MigrationRecord] {
+        &self.migration_log
+    }
+
+    /// The id of the node whose local slab contains `x`, or `None` if `x`
+    /// is outside the global domain. Nudges a coordinate that exactly
+    /// equals the *global* x-max inward by an epsilon before the lookup —
+    /// the same fix `mitonano_orchestrator`'s own `domain_containing` bug
+    /// required (see that crate's `domain.rs` module docs), applied here
+    /// from the start rather than rediscovered the hard way a second
+    /// time.
+    fn node_for_x(&self, x: f64) -> Option<usize> {
+        const EPS: f64 = 1e-9;
+        let adjusted = if (x - self.global_bounds.max[0]).abs() < EPS { self.global_bounds.max[0] - EPS } else { x };
+        self.nodes.iter().find(|n| adjusted >= n.local_bounds.min[0] && adjusted < n.local_bounds.max[0]).map(|n| n.id)
+    }
+
+    /// Adds an agent with a caller-supplied `id` (see module docs on why
+    /// identity is tracked here rather than in `mitonano_core::Agent`
+    /// itself) to whichever node's local slab currently contains its
+    /// position. Panics if the position is outside the global domain.
+    pub fn add_agent(&mut self, id: u64, position: [f64; 3], payload: f64) {
+        let target = self.node_for_x(position[0]).expect("add_agent: position is outside the global domain");
+        self.nodes[target].engine.agents.push(Agent::new(position, payload));
+        self.nodes[target].agent_ids.push(id);
+    }
+
+    /// Advances the whole distributed simulation by exactly one tick.
+    ///
+    /// This does **not** call `UnifiedEngine::run` — it reimplements that
+    /// method's exact per-tick body (motion + field uptake/release/decay,
+    /// then index rebuild + local agent-agent interaction, then field
+    /// diffusion) directly against `UnifiedEngine`'s public fields, move
+    /// for move, identical to `unified_engine.rs`'s own loop. That's
+    /// deliberate, not a rewrite for its own sake: `run` is one atomic
+    /// call with no way to intervene mid-loop, and cross-node coupling has
+    /// to be inserted *between* phases — after every node's local
+    /// motion/interaction/diffusion, using a snapshot taken at the right
+    /// moment, not before or during. Reimplementing the sequence here is
+    /// what makes that possible without modifying the verbatim
+    /// `unified_engine.rs` at all.
+    ///
+    /// Per tick, in order:
+    ///
+    /// 1. **Motion + field coupling**, every node independently — exactly
+    ///    `UnifiedEngine::run`'s own per-agent loop, replicated.
+    /// 2. **Local agent-agent interaction**, every node independently —
+    ///    exactly `UnifiedEngine::run`'s own `index.rebuild` +
+    ///    `step_agent_interactions`, replicated, unchanged.
+    /// 3. **Cross-node agent-agent interaction** (the actual new
+    ///    physics): for every pair of nodes whose slabs are within
+    ///    `interaction.radius` of each other, every agent pair across
+    ///    the two nodes within `radius` exchanges payload with the same
+    ///    `k_exchange * (payload_j - payload_i) * dt` formula
+    ///    `mitonano_core::interaction` uses locally — computed from a
+    ///    snapshot taken *before* step 2 mutates any payload, so the
+    ///    result is independent of processing order and exactly
+    ///    conservative (`flux(i,j) == -flux(j,i)`, the same antisymmetry
+    ///    `mitonano_core::interaction`'s own docs describe).
+    /// 4. **Field diffusion**: every node's own interior-only `step`
+    ///    (exactly `mitonano_core::concentration`'s existing scheme,
+    ///    unchanged), followed by a **cross-node boundary correction**
+    ///    for every pair of *physically adjacent* nodes (diffusion,
+    ///    unlike interaction, only ever crosses one seam at a time) —
+    ///    computed from a pre-diffusion snapshot of both sides'
+    ///    boundary layers using the exact same `(mass_a - mass_b) /
+    ///    spacing^2` formula the interior scheme uses internally (see
+    ///    `ConcentrationField::boundary_mass`'s docs), applied with
+    ///    `add_boundary_mass` to both sides with opposite sign. Because
+    ///    both the interior step and the boundary correction read from
+    ///    the *same* pre-tick snapshot (the boundary snapshot is taken
+    ///    before any node's interior `step` runs), this isn't an
+    ///    approximate operator split — it's algebraically identical to
+    ///    what one monolithic grid spanning both nodes would compute in
+    ///    a single pass, verified directly in
+    ///    `tests/equivalence.rs`.
+    /// 5. **Migration**: any agent that ended up outside its own node's
+    ///    local slab (from step 1's motion) is moved into whichever
+    ///    node's slab now contains it — unchanged from the previous
+    ///    revision.
+    ///
+    /// With only cross-node coupling disabled (i.e. `num_nodes == 1`,
+    /// where steps 3-4's cross-node corrections are trivially empty),
+    /// this reduces to exactly the same sequence `UnifiedEngine::run`
+    /// performs — see `tests/conservation.rs`'s
+    /// `single_node_cluster_matches_a_bare_unified_engine_exactly` for
+    /// the regression test confirming that equivalence still holds after
+    /// this rewrite.
+    pub fn step<R: Rng + ?Sized>(&mut self, rng: &mut R) {
+        self.tick += 1;
+        let n = self.nodes.len();
+
+        // ---- Phase 1: motion + field release/uptake/decay, every node
+        // independently. Replicates unified_engine.rs's own per-agent
+        // loop body exactly (see that file's `run` method).
+        for node in &mut self.nodes {
+            let params = node.engine.params;
+            let bounds = node.engine.bounds;
+            let dt = node.engine.dt;
+            let k_uptake = self.k_uptake;
+            for agent in &mut node.engine.agents {
+                agent.advance_position(&params, &bounds, dt, rng);
+                let c_local = node.engine.field.sample(agent.position);
+                let desired_uptake = k_uptake * c_local * dt;
+                let actual_uptake = node.engine.field.withdraw(agent.position, desired_uptake);
+                agent.payload += actual_uptake;
+                let (released, eliminated) = agent.decay_and_release(&params, dt);
+                self.cumulative_eliminated += eliminated;
+                if released > 0.0 {
+                    node.engine.field.deposit(agent.position, released);
+                }
+            }
+        }
+
+        // ---- Snapshot every node's post-motion, pre-interaction agent
+        // state, for exact-antisymmetry cross-node exchange in phase 3.
+        let position_snapshots: Vec<Vec<[f64; 3]>> = self.nodes.iter().map(|n| n.engine.agents.iter().map(|a| a.position).collect()).collect();
+        let payload_snapshots: Vec<Vec<f64>> = self.nodes.iter().map(|n| n.engine.agents.iter().map(|a| a.payload).collect()).collect();
+
+        // ---- Phase 2: local agent-agent interaction, every node
+        // independently. Exactly unified_engine.rs's own
+        // index.rebuild + step_agent_interactions, unchanged.
+        for node in &mut self.nodes {
+            node.engine.index.rebuild(&node.engine.agents);
+            let interaction = node.engine.interaction;
+            let dt = node.engine.dt;
+            step_agent_interactions(&mut node.engine.agents, &node.engine.index, &interaction, dt);
+        }
+
+        // ---- Phase 3: cross-node agent-agent interaction — the actual
+        // new physics. Only node pairs whose slabs are within `radius`
+        // of each other can possibly have an interacting pair; since
+        // slabs are sorted along x, a gap larger than `radius` for pair
+        // (i, j) means every pair (i, j') with j' > j is farther still,
+        // so the inner loop can stop early exactly like
+        // mitonano_orchestrator::coordinator::exchange_boundaries does.
+        let mut cross_deltas: Vec<Vec<f64>> = self.nodes.iter().map(|n| vec![0.0; n.engine.agents.len()]).collect();
+        for i in 0..n {
+            let radius = self.nodes[i].engine.interaction.radius;
+            let k_exchange = self.nodes[i].engine.interaction.k_exchange;
+            let dt = self.nodes[i].engine.dt;
+            let radius_sq = radius * radius;
+            for j in (i + 1)..n {
+                let gap = self.nodes[j].local_bounds.min[0] - self.nodes[i].local_bounds.max[0];
+                if gap > radius {
+                    break;
+                }
+                for (a_idx, &pos_a) in position_snapshots[i].iter().enumerate() {
+                    for (b_idx, &pos_b) in position_snapshots[j].iter().enumerate() {
+                        let dx = pos_a[0] - pos_b[0];
+                        let dy = pos_a[1] - pos_b[1];
+                        let dz = pos_a[2] - pos_b[2];
+                        if dx * dx + dy * dy + dz * dz <= radius_sq {
+                            let flux = k_exchange * (payload_snapshots[j][b_idx] - payload_snapshots[i][a_idx]) * dt;
+                            cross_deltas[i][a_idx] += flux;
+                            cross_deltas[j][b_idx] -= flux;
+                        }
+                    }
+                }
+            }
+        }
+        for (node, deltas) in self.nodes.iter_mut().zip(cross_deltas.iter()) {
+            for (agent, d) in node.engine.agents.iter_mut().zip(deltas.iter()) {
+                agent.payload += d;
+            }
+        }
+
+        // ---- Phase 4: field diffusion. Snapshot pre-diffusion boundary
+        // mass on both faces of every node first (diffusion, unlike
+        // interaction, only ever crosses one seam — no early-break scan
+        // needed, just each adjacent pair once), run every node's own
+        // unchanged interior diffusion, then apply the cross-node
+        // boundary correction computed from the snapshot.
+        let boundary_max: Vec<Vec<f64>> = self.nodes.iter().map(|n| n.engine.field.boundary_mass(XFace::Max)).collect();
+        let boundary_min: Vec<Vec<f64>> = self.nodes.iter().map(|n| n.engine.field.boundary_mass(XFace::Min)).collect();
+        let spacings_x: Vec<f64> = self.nodes.iter().map(|n| n.engine.field.cell_size()[0]).collect();
+
+        for node in &mut self.nodes {
+            let dt = node.engine.dt;
+            let d = node.engine.field_diffusion_coeff;
+            node.engine.field.step(dt, d);
+        }
+
+        for i in 0..n.saturating_sub(1) {
+            let j = i + 1;
+            let d = self.nodes[i].engine.field_diffusion_coeff;
+            let dt = self.nodes[i].engine.dt;
+            let spacing = spacings_x[i]; // == spacings_x[j] by construction (uniform field_grid config)
+            let layer_len = boundary_max[i].len();
+            let mut flux = vec![0.0; layer_len];
+            for k in 0..layer_len {
+                let mass_i = boundary_max[i][k];
+                let mass_j = boundary_min[j][k];
+                flux[k] = d * dt * (mass_i - mass_j) / (spacing * spacing);
+            }
+            let neg_flux: Vec<f64> = flux.iter().map(|f| -f).collect();
+            self.nodes[i].engine.field.add_boundary_mass(XFace::Max, &neg_flux);
+            self.nodes[j].engine.field.add_boundary_mass(XFace::Min, &flux);
+        }
+
+        // ---- Phase 5: migration — unchanged from the previous revision.
+        let slab_bounds: Vec<(usize, f64, f64)> = self.nodes.iter().map(|n| (n.id, n.local_bounds.min[0], n.local_bounds.max[0])).collect();
+        let global_max_x = self.global_bounds.max[0];
+        let node_for_x = |x: f64| -> Option<usize> {
+            const EPS: f64 = 1e-9;
+            let adjusted = if (x - global_max_x).abs() < EPS { global_max_x - EPS } else { x };
+            slab_bounds.iter().find(|(_, min_x, max_x)| adjusted >= *min_x && adjusted < *max_x).map(|(id, _, _)| *id)
+        };
+
+        let mut pending: Vec<(u64, Agent, usize, usize)> = Vec::new();
+        for node in &mut self.nodes {
+            let mut i = 0;
+            while i < node.engine.agents.len() {
+                let agent = node.engine.agents[i];
+                let x = agent.position[0];
+                if x >= node.local_bounds.min[0] && x < node.local_bounds.max[0] {
+                    i += 1;
+                    continue;
+                }
+                let target = node_for_x(x)
+                    .expect("step: an agent's motion is bounds-reflected against the global domain and can never leave it");
+                if target == node.id {
+                    // Half-open containment can transiently disagree with
+                    // itself right at a node's own far edge (mirrors
+                    // mitonano_orchestrator::node.rs's identical
+                    // reasoning) — not a migration.
+                    i += 1;
+                    continue;
+                }
+                let removed_agent = node.engine.agents.swap_remove(i);
+                let removed_id = node.agent_ids.swap_remove(i);
+                pending.push((removed_id, removed_agent, node.id, target));
+                // Do not increment `i`: swap_remove moved a different
+                // element into slot `i`, which still needs checking.
+            }
+        }
+        for (agent_id, agent, from_node, to_node) in pending {
+            self.nodes[to_node].engine.agents.push(agent);
+            self.nodes[to_node].agent_ids.push(agent_id);
+            self.migration_log.push(MigrationRecord { agent_id, from_node, to_node, tick: self.tick });
+        }
+    }
+
+    /// Aggregated mass-bookkeeping snapshot across every node's engine
+    /// and field — the distributed analogue of
+    /// `UnifiedEngine`'s own internal `stats` (private there; this is
+    /// the cross-node sum of the same quantities).
+    pub fn stats(&self) -> FederatedTickStats {
+        let total_agent_payload: f64 = self.nodes.iter().flat_map(|n| n.engine.agents.iter()).map(|a| a.payload).sum();
+        let total_field_mass: f64 = self.nodes.iter().map(|n| n.engine.field.total_mass()).sum();
+        FederatedTickStats {
+            tick: self.tick,
+            total_agent_payload,
+            total_field_mass,
+            total_combined_mass: total_agent_payload + total_field_mass,
+            cumulative_eliminated: self.cumulative_eliminated,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn default_config() -> FederatedEngineConfig {
+        FederatedEngineConfig {
+            agent_params: AgentParams { drift: [0.3, 0.0, 0.0], diffusion_coeff: 0.15, k_elim: 0.0, k_release: 0.2 },
+            interaction: InteractionParams { radius: 1.0, k_exchange: 0.2 },
+            field_diffusion_coeff: 0.1,
+            dt: 0.01,
+            k_uptake: 0.2,
+            field_grid: (4, 3, 3),
+            index_grid: (4, 3, 3),
+        }
+    }
+
+    fn global_bounds() -> Bounds {
+        Bounds::new([0.0, -5.0, -5.0], [40.0, 5.0, 5.0])
+    }
+
+    #[test]
+    fn new_creates_the_requested_number_of_nodes_with_correct_slab_bounds() {
+        let engine = FederatedUnifiedEngine::new(4, global_bounds(), default_config());
+        assert_eq!(engine.nodes.len(), 4);
+        assert_eq!(engine.nodes[0].local_bounds.min[0], 0.0);
+        assert_eq!(engine.nodes[0].local_bounds.max[0], 10.0);
+        assert_eq!(engine.nodes[3].local_bounds.max[0], 40.0);
+    }
+
+    #[test]
+    fn add_agent_places_it_in_the_correct_node() {
+        let mut engine = FederatedUnifiedEngine::new(4, global_bounds(), default_config());
+        engine.add_agent(1, [25.0, 0.0, 0.0], 5.0); // slab [20,30) -> node 2
+        assert_eq!(engine.nodes[2].engine.agents.len(), 1);
+        assert_eq!(engine.nodes[2].agent_ids[0], 1);
+        assert_eq!(engine.total_agent_count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the global domain")]
+    fn add_agent_rejects_a_position_outside_the_global_domain() {
+        let mut engine = FederatedUnifiedEngine::new(2, global_bounds(), default_config());
+        engine.add_agent(1, [999.0, 0.0, 0.0], 1.0);
+    }
+
+    #[test]
+    fn stepping_conserves_total_agent_count_across_real_physics_and_migrations() {
+        let mut config = default_config();
+        config.agent_params.drift = [2.0, 0.0, 0.0]; // fast enough to reliably cross a 10-unit slab within the tick budget below
+        let mut engine = FederatedUnifiedEngine::new(4, global_bounds(), config);
+        for i in 0..20 {
+            engine.add_agent(i, [1.0 + i as f64 * 0.05, 0.0, 0.0], 5.0);
+        }
+        let expected = engine.total_agent_count();
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..1000 {
+            engine.step(&mut rng);
+            assert_eq!(engine.total_agent_count(), expected, "real physics + migration must conserve agent count");
+        }
+        assert!(!engine.migration_log().is_empty(), "drift of 2.0*dt=0.02/tick over 1000 ticks (20 units total) across 10-unit-wide slabs should produce migrations");
+    }
+
+    /// Confirms migration is actually happening to the *correct* target,
+    /// not just that counts stay conserved — a specific agent, tracked by
+    /// id, must end up in the node whose slab its final position falls
+    /// in.
+    #[test]
+    fn a_specific_agent_migrates_to_the_node_matching_its_final_position() {
+        let mut engine = FederatedUnifiedEngine::new(4, global_bounds(), default_config());
+        engine.add_agent(42, [1.0, 0.0, 0.0], 5.0);
+        let mut rng = StdRng::seed_from_u64(99);
+        for _ in 0..500 {
+            engine.step(&mut rng);
+        }
+        // Find agent 42 wherever it ended up.
+        let mut found = None;
+        for node in &engine.nodes {
+            if let Some(pos) = node.agent_ids.iter().position(|&id| id == 42) {
+                found = Some((node.id, node.engine.agents[pos].position[0]));
+            }
+        }
+        let (node_id, x) = found.expect("agent 42 must exist in exactly one node");
+        assert!(x >= engine.nodes[node_id].local_bounds.min[0] && x < engine.nodes[node_id].local_bounds.max[0] || (x - engine.global_bounds.max[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn single_node_cluster_matches_a_bare_unified_engine_exactly() {
+        let config = default_config();
+        let bounds = global_bounds();
+
+        // Federated, 1 node.
+        let mut fed = FederatedUnifiedEngine::new(1, bounds, config);
+        fed.add_agent(1, [5.0, 0.0, 0.0], 3.0);
+        fed.add_agent(2, [8.0, 1.0, -1.0], 4.0);
+        let mut rng_fed = StdRng::seed_from_u64(555);
+        for _ in 0..50 {
+            fed.step(&mut rng_fed);
+        }
+        let fed_stats = fed.stats();
+
+        // Bare UnifiedEngine, identical setup.
+        let field = ConcentrationField::new(bounds, config.field_grid.0, config.field_grid.1, config.field_grid.2);
+        let index = SpatialIndex::new(bounds, config.index_grid.0, config.index_grid.1, config.index_grid.2);
+        let agents = vec![Agent::new([5.0, 0.0, 0.0], 3.0), Agent::new([8.0, 1.0, -1.0], 4.0)];
+        let mut bare = UnifiedEngine::new(agents, config.agent_params, bounds, field, config.field_diffusion_coeff, index, config.interaction, config.dt);
+        let mut rng_bare = StdRng::seed_from_u64(555);
+        let history = bare.run(50, config.k_uptake, &mut rng_bare);
+        let bare_last = history.last().unwrap();
+
+        assert!((fed_stats.total_agent_payload - bare_last.total_agent_payload).abs() < 1e-9);
+        assert!((fed_stats.total_field_mass - bare_last.total_field_mass).abs() < 1e-9);
+        assert!((fed_stats.cumulative_eliminated - bare_last.cumulative_eliminated).abs() < 1e-9);
+    }
+}
