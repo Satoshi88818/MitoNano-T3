@@ -1,0 +1,293 @@
+//! 1D domain decomposition along the x-axis (matching the source
+//! material's own stated scope — "starter... extend to 3D kd-tree later").
+//!
+//! One real bug fixed here that the source material had: `DomainDecomposition::new`
+//! divided the global x-extent by `num_nodes` with no check that
+//! `num_nodes > 0`, which would panic on division by zero (or rather,
+//! produce `f64::INFINITY`/`NaN` sub-domain widths silently, since `f64`
+//! division by `0.0` doesn't panic — arguably worse, since it would fail
+//! silently downstream instead of failing loudly at the call site).
+
+use nalgebra::Point3;
+
+use crate::environment::Bounds;
+use crate::node::MitoNode;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SubDomain {
+    pub id: usize,
+    pub bounds: Bounds,
+    pub halo_thickness: f64,
+}
+
+pub struct DomainDecomposition {
+    pub global_bounds: Bounds,
+    pub sub_domains: Vec<SubDomain>,
+}
+
+impl DomainDecomposition {
+    /// Splits `global` into `num_nodes` equal-width slabs along x.
+    ///
+    /// # Panics
+    /// Panics if `num_nodes == 0` — the source material's version would
+    /// have silently divided by zero instead.
+    pub fn new(global: Bounds, num_nodes: usize) -> Self {
+        assert!(num_nodes > 0, "DomainDecomposition::new requires at least one node, got 0");
+        let dx = (global.max[0] - global.min[0]) / num_nodes as f64;
+        let mut sub_domains = Vec::with_capacity(num_nodes);
+        for i in 0..num_nodes {
+            let min_x = global.min[0] + i as f64 * dx;
+            // Snap the last sub-domain's max exactly to the global max
+            // rather than accumulated-multiplication's floating point
+            // result, so the decomposition provably covers the whole
+            // global domain with no gap at the far edge.
+            let max_x = if i == num_nodes - 1 { global.max[0] } else { min_x + dx };
+            let bounds = Bounds::new(
+                [min_x, global.min[1], global.min[2]],
+                [max_x, global.max[1], global.max[2]],
+            );
+            sub_domains.push(SubDomain { id: i, bounds, halo_thickness: 5.0 }); // tune based on interaction/diffusion radius
+        }
+        Self { global_bounds: global, sub_domains }
+    }
+
+    pub fn create_nodes(&self) -> Vec<MitoNode> {
+        self.sub_domains.iter().map(|sd| MitoNode::new(sd.id, sd.bounds)).collect()
+    }
+
+    /// Builds a decomposition from explicit interior x-boundaries instead
+    /// of equal-width slabs — what `coordinator::rebalance` uses to
+    /// install a median-cut layout computed from current agent positions.
+    ///
+    /// Boundaries outside `(global.min[0], global.max[0])` are dropped,
+    /// and boundaries within `1e-9` of each other are deduplicated. That
+    /// dedup is a real, necessary fix, not defensive paranoia: if many
+    /// agents sit at (or extremely near) the same x-position, a median-cut
+    /// can propose two "different" boundaries that are actually identical,
+    /// which would otherwise produce a zero-width sub-domain. The
+    /// dedup means the result can have *fewer* sub-domains than
+    /// `boundaries.len() + 1` in that degenerate case — no 1D spatial
+    /// boundary can separate agents that are, physically, at the same
+    /// position, so asking for more sub-domains than the data can actually
+    /// support is not satisfiable, and this returns the largest
+    /// satisfiable decomposition rather than panicking or producing
+    /// degenerate zero-width slabs.
+    pub fn with_boundaries(global: Bounds, boundaries: Vec<f64>) -> Self {
+        let mut interior: Vec<f64> = boundaries
+            .into_iter()
+            .filter(|b| *b > global.min[0] && *b < global.max[0])
+            .collect();
+        interior.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        interior.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+
+        let mut cuts = vec![global.min[0]];
+        cuts.extend(interior);
+        cuts.push(global.max[0]);
+
+        let mut sub_domains = Vec::with_capacity(cuts.len() - 1);
+        for i in 0..cuts.len() - 1 {
+            let min_x = cuts[i];
+            let max_x = if i == cuts.len() - 2 { global.max[0] } else { cuts[i + 1] };
+            let bounds = Bounds::new(
+                [min_x, global.min[1], global.min[2]],
+                [max_x, global.max[1], global.max[2]],
+            );
+            sub_domains.push(SubDomain { id: i, bounds, halo_thickness: 5.0 });
+        }
+        Self { global_bounds: global, sub_domains }
+    }
+
+    /// Ids of every sub-domain narrower (in x) than `2 * halo_thickness`.
+    ///
+    /// This matters specifically because of `with_boundaries`/`rebalance`:
+    /// the equal-width `new` constructor can't produce this by
+    /// construction (every slab is deliberately the same width), but a
+    /// median-cut rebalance driven by a skewed agent distribution
+    /// genuinely can produce a very thin slab. A sub-domain narrower than
+    /// its own halo diameter breaks the "only check immediate neighbors"
+    /// optimization `coordinator::exchange_boundaries` relies on (a halo
+    /// could then reach past an immediate neighbor into the next one over)
+    /// — this is *detection* of that condition, not a fix; see
+    /// `coordinator.rs`'s `rebalance` docs for what currently happens when
+    /// it fires.
+    pub fn narrow_subdomains(&self) -> Vec<usize> {
+        self.sub_domains
+            .iter()
+            .filter(|sd| (sd.bounds.max[0] - sd.bounds.min[0]) < 2.0 * sd.halo_thickness)
+            .map(|sd| sd.id)
+            .collect()
+    }
+
+    /// The id of the sub-domain that strictly contains `point`, if any.
+    /// `None` means `point` has left the *global* domain entirely (a real
+    /// case `node.rs`'s migration logic must handle — see its module
+    /// docs for how).
+    pub fn domain_containing(&self, point: Point3<f64>) -> Option<usize> {
+        self.sub_domains.iter().find(|sd| sd.bounds.contains(point)).map(|sd| sd.id)
+    }
+
+    /// Every sub-domain whose halo-expanded bounds include `point` — used
+    /// for boundary/ghost-region exchange (a point can be relevant to a
+    /// neighboring domain's halo even though that domain doesn't strictly
+    /// contain it).
+    pub fn neighbors_of(&self, point: Point3<f64>) -> Vec<usize> {
+        self.sub_domains
+            .iter()
+            .filter(|sd| sd.bounds.contains_with_halo(point, sd.halo_thickness))
+            .map(|sd| sd.id)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "at least one node")]
+    fn rejects_zero_nodes() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]);
+        let _ = DomainDecomposition::new(global, 0);
+    }
+
+    #[test]
+    fn produces_requested_number_of_subdomains() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]);
+        let decomp = DomainDecomposition::new(global, 4);
+        assert_eq!(decomp.sub_domains.len(), 4);
+    }
+
+    #[test]
+    fn subdomains_exactly_tile_the_global_domain_with_no_gap_or_overlap() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 50.0, 50.0]);
+        let decomp = DomainDecomposition::new(global, 7);
+        // No gap: each sub-domain's max_x should equal the next's min_x exactly.
+        for window in decomp.sub_domains.windows(2) {
+            assert!(
+                (window[0].bounds.max[0] - window[1].bounds.min[0]).abs() < 1e-9,
+                "gap or overlap between sub-domains {} and {}",
+                window[0].id,
+                window[1].id
+            );
+        }
+        // Full coverage: first sub-domain starts exactly at global min,
+        // last ends exactly at global max.
+        assert_eq!(decomp.sub_domains.first().unwrap().bounds.min[0], global.min[0]);
+        assert_eq!(decomp.sub_domains.last().unwrap().bounds.max[0], global.max[0]);
+    }
+
+    #[test]
+    fn single_node_decomposition_covers_the_whole_domain() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::new(global, 1);
+        assert_eq!(decomp.sub_domains.len(), 1);
+        assert_eq!(decomp.sub_domains[0].bounds, global);
+    }
+
+    #[test]
+    fn domain_containing_finds_the_correct_subdomain() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::new(global, 4);
+        // slabs: [0,25) [25,50) [50,75) [75,100]
+        assert_eq!(decomp.domain_containing(Point3::new(5.0, 5.0, 5.0)), Some(0));
+        assert_eq!(decomp.domain_containing(Point3::new(30.0, 5.0, 5.0)), Some(1));
+        assert_eq!(decomp.domain_containing(Point3::new(99.0, 5.0, 5.0)), Some(3));
+    }
+
+    #[test]
+    fn domain_containing_returns_none_outside_global_bounds() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::new(global, 4);
+        assert_eq!(decomp.domain_containing(Point3::new(150.0, 5.0, 5.0)), None);
+        assert_eq!(decomp.domain_containing(Point3::new(-5.0, 5.0, 5.0)), None);
+    }
+
+    #[test]
+    fn neighbors_of_includes_adjoining_domain_within_halo() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::new(global, 4);
+        // boundary between domain 0/1 at x=25
+        let near_boundary = Point3::new(24.0, 5.0, 5.0); // strictly in domain 0, within halo (5.0) of domain 1
+        let neighbors = decomp.neighbors_of(near_boundary);
+        assert!(neighbors.contains(&0));
+        assert!(
+            neighbors.contains(&1),
+            "point within halo distance of domain 1's boundary should list it as a neighbor"
+        );
+    }
+
+    #[test]
+    fn create_nodes_produces_one_node_per_subdomain_with_matching_bounds() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [40.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::new(global, 4);
+        let nodes = decomp.create_nodes();
+        assert_eq!(nodes.len(), 4);
+        for (node, sd) in nodes.iter().zip(decomp.sub_domains.iter()) {
+            assert_eq!(node.id, sd.id);
+            assert_eq!(node.local_bounds, sd.bounds);
+        }
+    }
+
+    #[test]
+    fn with_boundaries_produces_correct_subdomain_count_and_coverage() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::with_boundaries(global, vec![30.0, 55.0, 80.0]);
+        assert_eq!(decomp.sub_domains.len(), 4);
+        assert_eq!(decomp.sub_domains[0].bounds.min[0], 0.0);
+        assert_eq!(decomp.sub_domains[0].bounds.max[0], 30.0);
+        assert_eq!(decomp.sub_domains[1].bounds.min[0], 30.0);
+        assert_eq!(decomp.sub_domains[1].bounds.max[0], 55.0);
+        assert_eq!(decomp.sub_domains[3].bounds.max[0], 100.0);
+    }
+
+    #[test]
+    fn with_boundaries_deduplicates_near_identical_boundaries() {
+        // Simulates the degenerate case: a median-cut on many
+        // same-position agents can propose "different" boundaries that
+        // are actually identical (or within float noise). The result
+        // should have fewer sub-domains than boundaries.len()+1, not a
+        // zero-width sub-domain or a panic.
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::with_boundaries(global, vec![50.0, 50.0 + 1e-12, 50.0]);
+        assert_eq!(
+            decomp.sub_domains.len(),
+            2,
+            "three collapsed-duplicate boundaries should yield 2 sub-domains, not 4"
+        );
+        for sd in &decomp.sub_domains {
+            assert!(
+                sd.bounds.max[0] - sd.bounds.min[0] > 0.0,
+                "no sub-domain should have zero or negative width"
+            );
+        }
+    }
+
+    #[test]
+    fn with_boundaries_ignores_boundaries_outside_the_global_domain() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::with_boundaries(global, vec![-10.0, 50.0, 200.0]);
+        assert_eq!(
+            decomp.sub_domains.len(),
+            2,
+            "out-of-range boundaries should be dropped, not clamped into extra tiny slabs"
+        );
+    }
+
+    #[test]
+    fn narrow_subdomains_flags_a_slab_thinner_than_its_own_halo_diameter() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        // Default halo_thickness is 5.0, so 2*halo = 10.0; a slab from
+        // 50.0 to 53.0 (width 3.0) is well under that.
+        let decomp = DomainDecomposition::with_boundaries(global, vec![50.0, 53.0]);
+        let narrow = decomp.narrow_subdomains();
+        assert!(narrow.contains(&1), "the [50,53) slab should be flagged as narrower than 2*halo_thickness");
+    }
+
+    #[test]
+    fn narrow_subdomains_is_empty_for_a_normal_equal_width_decomposition() {
+        let global = Bounds::new([0.0, 0.0, 0.0], [100.0, 10.0, 10.0]);
+        let decomp = DomainDecomposition::new(global, 4);
+        // each slab 25 wide, halo 5 -> 2*halo=10 < 25
+        assert!(decomp.narrow_subdomains().is_empty());
+    }
+}
